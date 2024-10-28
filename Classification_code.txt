@@ -1,0 +1,185 @@
+// Wczytaj granice regionów (województw) Polski
+var polandRegions = ee.FeatureCollection('FAO/GAUL/2015/level2')
+  .filter(ee.Filter.or(
+    ee.Filter.eq('ADM1_NAME', 'Lubuskie'), 
+    ee.Filter.eq('ADM1_NAME', 'Dolnoslaskie') // Filtrowanie dla województwa dolnośląskiego
+  ));  
+
+// Wyświetl granice województw na mapie
+Map.centerObject(polandRegions, 8);  // Wycentruj mapę na województwach
+Map.addLayer(polandRegions, {color: 'blue'}, 'Lubuskie i Dolnośląskie');
+
+// Wyciągnij geometrię województw
+var lubuskie = polandRegions.filter(ee.Filter.eq('ADM1_NAME', 'Lubuskie'));
+var dolnoslaskie = polandRegions.filter(ee.Filter.eq('ADM1_NAME', 'Dolnośląskie'));
+
+// Wycentruj mapę na województwie lubuskim
+Map.centerObject(lubuskie, 8);  // Ustaw poziom powiększenia na 8
+
+// Determining the year for analysis
+var analysisYear = 2024;
+var startDate = ee.Date.fromYMD(analysisYear, 5, 1);
+var endDate = ee.Date.fromYMD(analysisYear, 10, 31);
+
+// Download LANDSAT/LC08/C01/T1_TOA data
+var landsatCollection = ee.ImageCollection("LANDSAT/LC09/C02/T1_TOA")
+  .filterBounds(polandRegions.geometry())  // Użyj granic województw
+  .filterDate(startDate, endDate)
+  .sort("CLOUD_COVER", true)
+  .limit(20);
+
+// Select the median image from the collection
+var medianImage = landsatCollection.median();
+
+// Trim LANDSAT images to the area of Lubuskie and Dolnośląskie
+var landsatImage = medianImage.clip(polandRegions.geometry());
+
+// Create an RGB image using red, green, and blue bands
+var rgbImage = landsatImage.select(['B4', 'B3', 'B2']);
+
+// Create an FCC image using NIR, Red, and Green bands
+var fccImage = landsatImage.select(['B5', 'B4', 'B3']);  // NIR, Red, Green
+
+// Mask pixels likely to contain clouds or cloud shadows
+var cloudMask = landsatImage.eq(61440)
+  .reduce(ee.Reducer.anyNonZero());
+var mask = cloudMask.not();
+var rgbMasked = rgbImage.updateMask(mask);
+var fccMasked = fccImage.updateMask(mask);  // Mask for FCC
+
+// Apply brightness and contrast adjustments to the RGB image
+var brightnessFactor = 1;
+var contrastFactor = 1;
+var rgbAdjusted = rgbMasked.multiply(brightnessFactor).multiply(contrastFactor);
+
+// Display the adjusted RGB image on the map
+Map.addLayer(rgbAdjusted, { min: 0, max: 0.3 }, 'Adjusted RGB Image');
+
+// Display the FCC image on the map
+Map.addLayer(fccMasked, { min: 0, max: 0.3 }, 'FCC Image');
+
+// Sharpening
+var hsv = rgbAdjusted.select(['B4', 'B3', 'B2']).rgbToHsv();
+var sharpened = ee.Image.cat([hsv.select('hue'), hsv.select('saturation'), landsatImage.select('B8')]).hsvToRgb();
+Map.addLayer(sharpened, { min: 0, max: 0.25, gamma: [1.3, 1.3, 1.3] }, 'Sharpened Image');
+
+// Add spectral channels
+var allBands = landsatImage.bandNames();
+var presentBands = sharpened.bandNames();
+var missingBands = allBands.removeAll(presentBands);
+var missingBandsImage = landsatImage.select(missingBands);
+
+// Add the missing bands image to the existing sharpened image with spectral channels
+sharpened = sharpened.addBands(missingBandsImage);
+
+// Select specific spectral bands of interest
+var bands = ['B2', 'B3', 'B4', 'B5', 'B6', 'B7'];
+
+// Load training data (sample points labeled as "water," "bare soil," "agricultural," "forest," "low-density housing," and "high-density housing")
+var trainingPoints = ee.FeatureCollection([
+  ee.Feature(AgriculturalAreas, { class: 2 }),  // Rolnictwo
+  ee.Feature(BareSoilAreas, { class: 1 }),      // Goła gleba
+  ee.Feature(Forests_SE, { class: 3 }),         // Las
+  ee.Feature(Water_Areas, { class: 0 }),        // Woda
+  ee.Feature(LowDensityHousingAreas, { class: 4 }), // Zabudowa niskiej gęstości
+  ee.Feature(HighDensityHousingAreas, { class: 5 })  // Zabudowa wysokiej gęstości
+]);
+
+// Extract pixel values for training data
+var training = landsatImage.select(bands).sampleRegions({
+  collection: trainingPoints,
+  properties: ['class'],
+  scale: 30
+});
+
+// Train a Random Forest classifier
+var classifier = ee.Classifier.smileRandomForest(10).train({
+  features: training,
+  classProperty: 'class',
+  inputProperties: bands
+});
+
+// Classify the entire image based on the trained parameters
+var classified = landsatImage.select(bands).classify(classifier);
+
+// Display classification results
+Map.addLayer(
+  classified,
+  { min: 0, max: 5, palette: ['blue', 'brown', 'green', 'darkgreen', 'yellow', 'orange'] },
+  'Classification'
+);
+
+// Calculate areas of individual classes
+var areas = classified.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(),
+  geometry: polandRegions.geometry(),  // Użyj granic województw
+  scale: 30,
+  maxPixels: 1e9
+});
+
+// Display areas of individual classes in the console
+print('Class Areas:');
+print(areas);
+
+// Function to calculate area in square meters
+var calculateArea = function(feature, classGeometry) {
+  var pixelArea = ee.Image.pixelArea();
+  var geometry = feature.geometry();
+  var areaImage = pixelArea.updateMask(feature);
+  var area = areaImage.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: classGeometry,  // Use the class-specific geometry
+    scale: 30,
+    maxPixels: 1e9
+  });
+  return ee.Feature(geometry, area);
+};
+
+// Define a legend for the map
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-right',
+    padding: '8px 15px'
+  }
+});
+
+// Create colored labels for classes
+var palette = ['blue', 'brown', 'yellow', 'darkgreen', 'orange', 'red'];
+var names = ['Water', 'Bare Soil', 'Agricultural', 'Forest', 'Low-Density Housing', 'High-Density Housing'];
+
+// Iterate through classes and create labels
+for (var i = 0; i < names.length; i++) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: palette[i],
+      padding: '8px',
+      margin: '0 0 4px 0'
+    }
+  });
+
+  var description = ui.Label({
+    value: names[i],
+    style: {
+      margin: '0 0 4px 6px'
+    }
+  });
+
+  legend.add(colorBox);
+  legend.add(description);
+}
+
+// Add legend to the map
+Map.add(legend);
+
+// Display final results
+Map.addLayer(classified, { min: 0, max: 5, palette: palette }, 'Final Classification');
+
+// Export the classified image as a TIFF file to Google Drive
+Export.image.toDrive({
+  image: classified,
+  description: 'Classified_Lubuskie_Dolnoslaskie',
+  scale: 30,
+  region: polandRegions.geometry(),
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e9
+});
