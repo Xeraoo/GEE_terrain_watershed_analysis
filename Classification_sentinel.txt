@@ -1,0 +1,165 @@
+// Load the boundaries of Polish regions (województwa)
+var polandRegions = ee.FeatureCollection('FAO/GAUL/2015/level2')
+  .filter(ee.Filter.or(
+    ee.Filter.eq('ADM1_NAME', 'Opolskie'),
+    ee.Filter.eq('ADM1_NAME', 'Slaskie')
+  ));   
+
+// Center the map on the selected regions
+Map.centerObject(polandRegions, 8);
+Map.addLayer(polandRegions, {color: 'blue'}, 'Poland Regions');
+
+// Define the time frame for the Sentinel-2 data
+var analysisYear = 2024;
+var startDate = ee.Date.fromYMD(analysisYear, 5, 1);
+var endDate = ee.Date.fromYMD(analysisYear, 10, 31);
+
+// Load Sentinel-2 surface reflectance data and filter by bounds, date, and cloud cover
+var sentinelCollection = ee.ImageCollection('COPERNICUS/S2_SR')
+  .filterBounds(polandRegions.geometry())
+  .filterDate(startDate, endDate)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
+
+// Calculate the median to reduce cloud cover
+var medianImage = sentinelCollection.median().clip(polandRegions.geometry());
+
+// Select RGB bands for visualization (B4: Red, B3: Green, B2: Blue)
+var rgbImage = medianImage.select(['B4', 'B3', 'B2']);
+
+// Select FCC bands for visualization (B8: NIR, B4: Red, B3: Green)
+var fccImage = medianImage.select(['B8', 'B4', 'B3']);
+
+// Apply cloud mask using Sentinel-2 cloud classification band
+var cloudMask = medianImage.select('MSK_CLASSI_OPAQUE').neq(1);
+var rgbMasked = rgbImage.updateMask(cloudMask);
+var fccMasked = fccImage.updateMask(cloudMask);
+
+// Adjust brightness and contrast of the RGB image for better visualization
+var brightnessFactor = 1;
+var contrastFactor = 1;
+var rgbAdjusted = rgbMasked.multiply(brightnessFactor).multiply(contrastFactor);
+
+// Display the RGB and FCC images on the map
+Map.addLayer(rgbAdjusted, { min: 0, max: 3000 }, 'Adjusted RGB Image');
+Map.addLayer(fccMasked, { min: 0, max: 3000 }, 'FCC Image');
+
+// Sharpening using the HSV technique
+var hsv = rgbAdjusted.rgbToHsv();
+var sharpened = ee.Image.cat([hsv.select('hue'), hsv.select('saturation'), medianImage.select('B8')]).hsvToRgb();
+Map.addLayer(sharpened, { min: 0, max: 3000, gamma: [1.3, 1.3, 1.3] }, 'Sharpened Image');
+
+// Define specific bands for classification
+var bands = ['B2', 'B3', 'B4', 'B5', 'B6', 'B7'];
+
+// Load sample points for training (Update these to valid geographic coordinates)
+var trainingPoints = ee.FeatureCollection([
+  ee.Feature(AgriculturalAreas, { class: 2 }),
+  ee.Feature(BareSoilAreas, { class: 1 }),
+  ee.Feature(Forests_SE, { class: 3 }),
+  ee.Feature(Water_Areas, { class: 0 }),
+  ee.Feature(LowDensityHousingAreas, { class: 4 }),
+  ee.Feature(HighDensityHousingAreas, { class: 5 })
+]);
+
+// Sample pixel values from Sentinel-2 data
+var training = medianImage.select(bands).sampleRegions({
+  collection: trainingPoints,
+  properties: ['class'],
+  scale: 10
+});
+
+// Train the classifier
+var classifier = ee.Classifier.smileRandomForest(10).train({
+  features: training,
+  classProperty: 'class',
+  inputProperties: bands
+});
+
+// Classify the image based on the trained classifier
+var classified = medianImage.select(bands).classify(classifier);
+
+// Display classification results on the map
+Map.addLayer(
+  classified,
+  { min: 0, max: 5, palette: ['blue', '#d2b48c', 'yellow', 'darkgreen', 'gray', 'red'] },
+  'Classification'
+);
+
+// Calculate areas for each class in the region
+var areas = classified.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(),
+  geometry: polandRegions.geometry(),
+  scale: 10,
+  maxPixels: 1e9
+});
+print('Class Areas:', areas);
+
+// Export the classified image to Google Drive
+Export.image.toDrive({
+  image: classified,
+  description: 'Classified_PolandRegions_Sentinel2',
+  scale: 10,
+  region: polandRegions.geometry(),
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e9
+});
+
+
+// Create a panel to hold the legend
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px 15px'
+  }
+});
+
+// Create legend title
+var legendTitle = ui.Label({
+  value: 'Land Cover Classification',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '16px',
+    margin: '0 0 4px 0',
+    padding: '0'
+  }
+});
+legend.add(legendTitle);
+
+// Define a function to create and style each row in the legend
+var makeLegendRow = function(color, name) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: color,
+      padding: '8px',
+      margin: '0 0 4px 0'
+    }
+  });
+  var description = ui.Label({
+    value: name,
+    style: {margin: '0 0 4px 6px'}
+  });
+  return ui.Panel({
+    widgets: [colorBox, description],
+    layout: ui.Panel.Layout.Flow('horizontal')
+  });
+};
+
+// Colors and names for each class
+// Update the color palette for classification and the corresponding legend
+var classColors = ['blue', '#d2b48c', 'yellow', 'darkgreen', 'gray', 'red'];
+var classNames = [
+  'Water Areas',           // Class 0
+  'Bare Soil Areas',       // Class 1
+  'Agricultural Areas',    // Class 2
+  'Forests',               // Class 3
+  'Low-Density Housing',   // Class 4
+  'High-Density Housing'   // Class 5
+];
+
+// Add each class to the legend
+for (var i = 0; i < classColors.length; i++) {
+  legend.add(makeLegendRow(classColors[i], classNames[i]));
+}
+
+// Add the legend to the map
+Map.add(legend);
