@@ -1,0 +1,114 @@
+// Load DEM (e.g., SRTM data) and clip to the custom boundary
+var dem = ee.Image('USGS/SRTMGL1_003').clip(customBoundary);
+Map.addLayer(dem, {min: 0, max: 3000, palette: ['blue', 'green', 'brown']}, 'DEM');
+
+// Load HydroSHEDS Flow Direction Data and clip to the custom boundary
+var flowDirection = ee.Image("WWF/HydroSHEDS/15ACC").clip(customBoundary);
+Map.addLayer(flowDirection, {palette: ['black', 'yellow', 'orange']}, 'Flow Direction');
+
+// Calculate flow accumulation using HydroSHEDS flow direction data
+var flowAccumulation = flowDirection.clip(customBoundary);
+Map.addLayer(flowAccumulation, {min: 0, max: 10000, palette: ['white', 'blue']}, 'Flow Accumulation');
+
+// Threshold to define streams based on flow accumulation
+var streams = flowAccumulation.gt(1000); // Adjust threshold as necessary
+Map.addLayer(streams, {palette: ['0000FF']}, 'Streams');
+
+// Reduce streams to points to identify catchment outlets within the custom boundary
+var outletPoints = streams.reduceToVectors({
+  geometry: customBoundary,
+  geometryType: 'centroid',
+  reducer: ee.Reducer.countEvery(),
+  scale: 90,
+  maxPixels: 1e8,
+  bestEffort: true
+});
+Map.addLayer(outletPoints, {color: 'red'}, 'Outlet Points');
+
+// Create a binary image to serve as the source for cumulative cost
+var outletSource = ee.Image.constant(0).clip(customBoundary).rename('source');
+
+// Paint outlet points as sources
+outletSource = outletSource.paint(outletPoints, 1);
+Map.addLayer(outletSource, {palette: ['FF0000']}, 'Outlet Source');
+
+// Create a catchment image to accumulate results
+var catchmentImage = ee.Image(0).clip(customBoundary); // Initialize an empty catchment image
+
+// Convert outletPoints to a FeatureCollection to access features
+var outletFeatureCollection = ee.FeatureCollection(outletPoints);
+
+// Loop through each outlet point to generate catchments
+outletFeatureCollection.evaluate(function(featureCollection) {
+  var features = featureCollection.features; // Access the features array
+
+  features.forEach(function(feature) {
+    var outletPoint = feature.geometry();
+
+    // Create a binary image for the outlet point
+    var outletBinary = ee.Image.constant(0).clip(customBoundary).rename('outlet');
+    outletBinary = outletBinary.paint(ee.FeatureCollection([ee.Feature(outletPoint)]), 1);
+
+    // Add the outlet binary layer to the map
+    Map.addLayer(outletBinary, {palette: ['00FF00']}, 'Outlet Binary');
+
+    // Calculate cumulative cost
+    var cumulativeCost = flowDirection.cumulativeCost({
+      source: outletBinary,
+      cost: dem,
+      maxDistance: 1000, // Maximum distance for the computation in meters
+      geodeticDistance: false // Use Euclidean distance
+    });
+
+    // Add the cumulative cost layer to the map
+    Map.addLayer(cumulativeCost, {min: 0, max: 5000, palette: ['white', 'red']}, 'Cumulative Cost');
+
+    // Define catchment area based on cumulative cost
+    var catchment = cumulativeCost.lt(1000); // Threshold to define the catchment area
+
+    // Add the catchment layer to the map
+    Map.addLayer(catchment, {palette: ['blue']}, 'Catchment for Outlet');
+
+    // Combine catchments into one image using addition
+    catchmentImage = catchmentImage.add(catchment); // Combine catchment images
+  });
+
+  // Convert combined catchment image to vectors
+  var catchmentsVector = catchmentImage.reduceToVectors({
+    geometry: customBoundary,
+    geometryType: 'polygon',
+    reducer: ee.Reducer.countEvery(),
+    scale: 100,
+    bestEffort: true,
+    maxPixels: 1e8
+  });
+
+  // Adding the vector layers of catchments to the map
+  Map.addLayer(catchmentsVector, {color: 'blue'}, 'Combined Catchments');
+
+  // Calculate catchment areas in square kilometers
+  var catchmentAreas = catchmentsVector.map(function(feature) {
+    var area = feature.geometry().area().divide(1e6); // Area in km²
+    return feature.set('area_km2', area);
+  });
+
+  // Add the layer with calculated areas to the map
+  Map.addLayer(catchmentAreas, {}, 'Catchments with Area');
+
+  // Export catchment areas to Google Drive as a shapefile
+  Export.table.toDrive({
+    collection: catchmentAreas,
+    description: 'Catchments_with_Area',
+    fileFormat: 'SHP'
+  });
+});
+
+// Add Odra_Point to the map for visualization
+Map.addLayer(odraPoint, {color: 'red'}, 'Odra Point');
+
+// Identify fourth-order tributaries based on flow accumulation
+var fourthOrderTributaries = flowAccumulation.gte(2500).and(flowAccumulation.lt(5000)); // Adjust thresholds for fourth-order streams
+Map.addLayer(fourthOrderTributaries.updateMask(fourthOrderTributaries), {palette: ['orange']}, 'Fourth Order Tributaries');
+
+// Center the map on the custom boundary
+Map.centerObject(customBoundary, 10);
